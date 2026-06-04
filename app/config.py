@@ -57,12 +57,17 @@ class Settings:
             self.files_dir,
             self.workspace_root_dir,
             self.events_dir,
+            self.session_trees_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
     @property
     def events_dir(self) -> Path:
         return (self.data_dir / "events").resolve()
+
+    @property
+    def session_trees_dir(self) -> Path:
+        return (self.data_dir / "session_trees").resolve()
 
     @classmethod
     def from_env(cls, base_dir: Path | None = None) -> "Settings":

@@ -99,6 +99,101 @@ class RunnerTestCase(unittest.TestCase):
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
+    def test_runner_creates_and_resumes_sessions_in_same_workspace(self) -> None:
+        root = Path.cwd() / "data" / "test-runner-session-tree"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            settings = self.make_settings(root)
+            settings.ensure_directories()
+            runner = Runner(settings)
+            workspace_id = "feishu-p2p-session-tree"
+
+            first_result = runner.run_turn(workspace_id, "shell echo shared > marker.txt")
+            first_session_id = first_result.conversation_id
+            new_result = runner.run_turn(workspace_id, "/new")
+            second_session_id = new_result.conversation_id
+
+            self.assertNotEqual(first_session_id, second_session_id)
+            self.assertEqual(runner.session_store.load(second_session_id, "").messages, [])
+            self.assertFalse((settings.workspace_root_dir / conversation_storage_name(second_session_id)).exists())
+
+            runner.run_turn(workspace_id, "read marker.txt")
+            second_session = runner.session_store.load(second_session_id, "")
+            self.assertIn("shared", second_session.messages[-2].content)
+            self.assertNotIn("/new", [message.content for message in second_session.messages])
+
+            list_result = runner.run_turn(workspace_id, "/resume")
+            self.assertIn(first_session_id, list_result.reply)
+            self.assertIn(second_session_id, list_result.reply)
+            self.assertNotIn("/resume", [message.content for message in second_session.messages])
+
+            switch_result = runner.run_turn(workspace_id, "/resume 2")
+            self.assertEqual(switch_result.conversation_id, first_session_id)
+            resumed_result = runner.run_turn(workspace_id, "hello again")
+            self.assertEqual(resumed_result.conversation_id, first_session_id)
+            self.assertIn("hello again", [message.content for message in resumed_result.messages])
+
+            other_session_id = runner.run_turn("other-workspace", "/new").conversation_id
+            denied_result = runner.run_turn(workspace_id, f"/resume {other_session_id}")
+            self.assertEqual(denied_result.conversation_id, first_session_id)
+            self.assertIn("未找到", denied_result.reply)
+
+            restarted_runner = Runner(settings)
+            restarted_result = restarted_runner.run_turn(workspace_id, "after restart")
+            self.assertEqual(restarted_result.conversation_id, first_session_id)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_session_commands_do_not_emit_stream_content(self) -> None:
+        root = Path.cwd() / "data" / "test-runner-session-command-stream"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            settings = self.make_settings(root)
+            settings.ensure_directories()
+            runner = Runner(settings)
+            chunks: list[str] = []
+
+            result = runner.run_turn_stream("stream-command", "/new", on_content_delta=chunks.append)
+
+            self.assertEqual(chunks, [])
+            self.assertEqual(runner.session_store.load(result.conversation_id, "").messages, [])
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_new_session_recovery_uses_parent_workspace(self) -> None:
+        root = Path.cwd() / "data" / "test-runner-session-recovery-workspace"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            settings = self.make_settings(root)
+            settings.ensure_directories()
+            workspace_id = "recovery-workspace"
+            self.make_workspace(settings, workspace_id).joinpath("sample.txt").write_text("shared", encoding="utf-8")
+            runner = Runner(settings)
+            session_id = runner.run_turn(workspace_id, "/new").conversation_id
+            runner.event_log.append(session_id, {"turn_id": "turn-1", "type": "turn_started"})
+            runner.event_log.append(
+                session_id,
+                {
+                    "turn_id": "turn-1",
+                    "type": "tool_call_started",
+                    "tool_call_id": "call-read",
+                    "tool_name": "read_file",
+                    "arguments": {"path": "sample.txt"},
+                },
+            )
+
+            restarted_runner = Runner(settings)
+            restarted_runner.recover_unfinished_tasks()
+
+            session = restarted_runner.session_store.load(session_id, "")
+            self.assertTrue(any(message.role == "tool" and "shared" in message.content for message in session.messages))
+            self.assertFalse((settings.workspace_root_dir / conversation_storage_name(session_id)).exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_workspace_isolation_flag_can_use_shared_workspace_baseline(self) -> None:
         root = Path.cwd() / "data" / "test-runner-workspace-baseline"
         shutil.rmtree(root, ignore_errors=True)

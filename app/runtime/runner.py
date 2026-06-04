@@ -22,6 +22,7 @@ from app.runtime.workspace_context import use_workspace_dir
 from app.schemas import TurnResult
 from app.storage.naming import conversation_storage_name
 from app.storage.session_store import JsonSessionStore
+from app.storage.session_tree_store import JsonSessionTreeStore
 from app.utils.logger import append_jsonl
 
 
@@ -43,6 +44,7 @@ class Runner:
             enable_older_memory=settings.feature_older_memory,
         )
         self.session_store = JsonSessionStore(settings.sessions_dir)
+        self.session_tree_store = JsonSessionTreeStore(settings.session_trees_dir)
         self.event_log = EventLog(settings.events_dir)
         self.recovery_manager = RecoveryManager(self.event_log)
         self.llm_client = self._build_llm_client()
@@ -63,7 +65,7 @@ class Runner:
         return cls(load_settings())
 
     def run_turn(self, conversation_id: str, user_input: str) -> TurnResult:
-        return self._run_turn_internal(conversation_id=conversation_id, user_input=user_input)
+        return self._dispatch_request(workspace_id=conversation_id, user_input=user_input)
 
     def run_turn_stream(
         self,
@@ -73,8 +75,8 @@ class Runner:
         on_reasoning_delta=None,
         on_tool_call_delta=None,
     ) -> TurnResult:
-        return self._run_turn_internal(
-            conversation_id=conversation_id,
+        return self._dispatch_request(
+            workspace_id=conversation_id,
             user_input=user_input,
             on_content_delta=on_content_delta,
             on_reasoning_delta=on_reasoning_delta,
@@ -95,7 +97,9 @@ class Runner:
         return unfinished_turns
 
     def _recover_turn(self, unfinished: UnfinishedTurn) -> None:
-        workspace_dir = self._workspace_for_conversation(unfinished.conversation_id)
+        session = self.session_store.load(conversation_id=unfinished.conversation_id, system_prompt="")
+        workspace_id = str(session.metadata.get("workspace_id") or unfinished.conversation_id)
+        workspace_dir = self._workspace_for_conversation(workspace_id)
         with use_workspace_dir(workspace_dir):
             self._recover_turn_in_workspace(unfinished=unfinished, workspace_dir=workspace_dir)
 
@@ -183,18 +187,25 @@ class Runner:
         )
         self._compact_event_log(unfinished.conversation_id)
 
-    def _run_turn_internal(
+    def _dispatch_request(
         self,
-        conversation_id: str,
+        workspace_id: str,
         user_input: str,
         on_content_delta=None,
         on_reasoning_delta=None,
         on_tool_call_delta=None,
     ) -> TurnResult:
-        workspace_dir = self._workspace_for_conversation(conversation_id)
+        command_result = self._handle_session_command(workspace_id=workspace_id, user_input=user_input)
+        if command_result is not None:
+            return command_result
+
+        tree = self.session_tree_store.get_or_create(workspace_id)
+        session_id = tree.active_session_id
+        workspace_dir = self._workspace_for_conversation(workspace_id)
         with use_workspace_dir(workspace_dir):
             return self._run_turn_in_workspace(
-                conversation_id=conversation_id,
+                session_id=session_id,
+                workspace_id=workspace_id,
                 user_input=user_input,
                 workspace_dir=workspace_dir,
                 on_content_delta=on_content_delta,
@@ -204,7 +215,8 @@ class Runner:
 
     def _run_turn_in_workspace(
         self,
-        conversation_id: str,
+        session_id: str,
+        workspace_id: str,
         user_input: str,
         workspace_dir: Path,
         on_content_delta=None,
@@ -212,8 +224,9 @@ class Runner:
         on_tool_call_delta=None,
     ) -> TurnResult:
         turn_id = str(uuid.uuid4())
-        event_sink = TurnEventSink(self.event_log, conversation_id=conversation_id, turn_id=turn_id)
-        session = self.session_store.load(conversation_id=conversation_id, system_prompt="")
+        event_sink = TurnEventSink(self.event_log, conversation_id=session_id, turn_id=turn_id)
+        session = self.session_store.load(conversation_id=session_id, system_prompt="")
+        session.metadata["workspace_id"] = workspace_id
         session.metadata["workspace_dir"] = str(workspace_dir)
         session.metadata["shell_execution_mode"] = self.settings.shell_execution_mode
         self._attach_project_memory(session)
@@ -245,12 +258,14 @@ class Runner:
         finally:
             self.context_manager.ensure_message_token_counts(session.messages)
             self.session_store.save(session)
+            self.session_tree_store.touch(workspace_id, session_id, title=user_input)
             context_stats = session.metadata.get("context_stats", {})
             append_jsonl(
-                self.settings.logs_dir / f"{conversation_storage_name(conversation_id)}.jsonl",
+                self.settings.logs_dir / f"{conversation_storage_name(session_id)}.jsonl",
                 {
                     "turn_id": turn_id,
-                    "conversation_id": conversation_id,
+                    "conversation_id": session_id,
+                    "workspace_id": workspace_id,
                     "user_input": user_input,
                     "selected_skills": session.metadata.get("selected_skills", []),
                     "workspace_dir": str(workspace_dir),
@@ -258,13 +273,62 @@ class Runner:
                     "context_stats": context_stats,
                 },
             )
-            self._compact_event_log(conversation_id)
+            self._compact_event_log(session_id)
 
         return TurnResult(
-            conversation_id=conversation_id,
+            conversation_id=session_id,
             reply=assistant_message.content,
             messages=session.messages,
         )
+
+    def _handle_session_command(self, workspace_id: str, user_input: str) -> TurnResult | None:
+        parts = user_input.strip().split(maxsplit=1)
+        command = parts[0].lower() if parts else ""
+        argument = parts[1].strip() if len(parts) > 1 else ""
+        if command not in {"/new", "/clear", "/resume"}:
+            return None
+
+        if command in {"/new", "/clear"}:
+            if argument:
+                return self._command_result(workspace_id, "用法：`/new` 或 `/clear`。")
+
+            node = self.session_tree_store.create_session(workspace_id)
+            workspace_dir = self._workspace_for_conversation(workspace_id)
+            session = Session(conversation_id=node.session_id, system_prompt="")
+            session.metadata["workspace_id"] = workspace_id
+            session.metadata["workspace_dir"] = str(workspace_dir)
+            session.metadata["shell_execution_mode"] = self.settings.shell_execution_mode
+            self.session_store.save(session)
+            return TurnResult(
+                conversation_id=node.session_id,
+                reply=f"已创建并切换到新会话。\nsession_id: `{node.session_id}`",
+            )
+
+        if not argument:
+            active_session_id, sessions = self.session_tree_store.list_sessions(workspace_id)
+            workspace_dir = self._workspace_for_conversation(workspace_id)
+            lines = [f"当前工作区：`{workspace_dir}`", "可恢复会话："]
+            for index, node in enumerate(sessions, start=1):
+                marker = " [当前]" if node.session_id == active_session_id else ""
+                lines.append(f"{index}. {node.title}{marker}")
+                lines.append(f"   `{node.session_id}` · {node.updated_at}")
+            lines.append("使用 `/resume <序号|session_id>` 切换。")
+            return TurnResult(conversation_id=active_session_id, reply="\n".join(lines))
+
+        selected = self.session_tree_store.switch_session(workspace_id, argument)
+        if selected is None:
+            return self._command_result(
+                workspace_id,
+                "未找到该会话。请先使用 `/resume` 查看当前工作区的会话列表。",
+            )
+        return TurnResult(
+            conversation_id=selected.session_id,
+            reply=f"已切换到会话：{selected.title}\nsession_id: `{selected.session_id}`",
+        )
+
+    def _command_result(self, workspace_id: str, reply: str) -> TurnResult:
+        tree = self.session_tree_store.get_or_create(workspace_id)
+        return TurnResult(conversation_id=tree.active_session_id, reply=reply)
 
     def _workspace_for_conversation(self, conversation_id: str) -> Path:
         workspace_dir = self.settings.workspace_root_dir

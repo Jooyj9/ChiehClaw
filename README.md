@@ -6,7 +6,7 @@
 
 - `ai`：统一消息结构、OpenAI 兼容 client、mock client
 - `agent`：同步 tool loop
-- `storage`：按 `conversation_id` 持久化 JSON 会话
+- `storage`：按 workspace 维护可切换 session tree，并持久化独立 JSON 会话
 - `runtime`：组合 runner，对外暴露 `run_turn`
 - `app.main`：本地 CLI 入口
 - `streaming`：CLI 默认流式输出
@@ -73,6 +73,8 @@ uv run python -m unittest
 Docker 部署说明见 `docs/docker-deploy.md`。
 
 工作区隔离与 shell sandbox 设计见 `docs/sandbox-workspace-guide.md`。
+
+同一 workspace 下可使用 `/new`（或 `/clear`）创建新会话，使用 `/resume` 查看列表、`/resume <序号|session_id>` 切换会话。设计见 `docs/session-tree-guide.md`。
 
 开启 `XXXCLAW_SHELL_EXECUTION_MODE=docker` 前，先构建 sandbox 镜像：
 
