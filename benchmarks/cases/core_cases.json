@@ -1,0 +1,595 @@
+{
+  "schema_version": 1,
+  "suite": "xxxclaw_core_benchmark",
+  "description": "Core benchmark cases for task success, tool quality, isolation safety, context retention, and recovery detection.",
+  "variants": {
+    "baseline": {
+      "description": "Feature flags disabled to approximate the old behavior.",
+      "settings": {
+        "feature_runtime_context": false,
+        "feature_older_memory": false,
+        "feature_recovery": false,
+        "feature_workspace_isolation": false,
+        "shell_execution_mode": "local"
+      }
+    },
+    "current": {
+      "description": "Current platform behavior with workspace isolation, runtime context, older memory, recovery, and Docker shell sandbox enabled.",
+      "settings": {
+        "feature_runtime_context": true,
+        "feature_older_memory": true,
+        "feature_recovery": true,
+        "feature_workspace_isolation": true,
+        "shell_execution_mode": "docker"
+      }
+    }
+  },
+  "default_limits": {
+    "max_tool_rounds": 6,
+    "timeout_seconds": 180
+  },
+  "cases": [
+    {
+      "id": "basic_create_python_file",
+      "category": "coding_basic",
+      "metric": "task_success_rate",
+      "mode": "llm_e2e",
+      "description": "Create a simple Python file in the current workspace.",
+      "fixture": {
+        "files": {}
+      },
+      "turns": [
+        {
+          "user": "在当前目录创建 hello.py，内容是打印 hello xxxclaw"
+        }
+      ],
+      "expected": {
+        "files_contain": {
+          "hello.py": "hello xxxclaw"
+        },
+        "files_absent": [],
+        "workspace_escape_allowed": false,
+        "min_success_variants": ["baseline", "current"]
+      },
+      "tags": ["write_file", "single_turn", "basic"]
+    },
+    {
+      "id": "basic_edit_existing_file",
+      "category": "coding_basic",
+      "metric": "task_success_rate",
+      "mode": "llm_e2e",
+      "description": "Edit one line in an existing file without rewriting unrelated content.",
+      "fixture": {
+        "files": {
+          "config.txt": "name=xxxclaw\nmode=dev\n"
+        }
+      },
+      "turns": [
+        {
+          "user": "把 config.txt 里的 mode=dev 改成 mode=prod，其他内容不要变"
+        }
+      ],
+      "expected": {
+        "files_contain": {
+          "config.txt": "mode=prod"
+        },
+        "files_not_contain": {
+          "config.txt": "mode=dev"
+        },
+        "files_contain_all": {
+          "config.txt": ["name=xxxclaw", "mode=prod"]
+        },
+        "min_success_variants": ["baseline", "current"]
+      },
+      "tags": ["edit_file", "file_integrity"]
+    },
+    {
+      "id": "basic_multi_file_project",
+      "category": "coding_basic",
+      "metric": "task_success_rate",
+      "mode": "llm_e2e",
+      "description": "Create a small two-file Python project.",
+      "fixture": {
+        "files": {}
+      },
+      "turns": [
+        {
+          "user": "创建一个 mini_calc 目录，里面写 calc.py 提供 add(a,b)，再写 main.py 调用 add(2,3) 并打印结果"
+        }
+      ],
+      "expected": {
+        "files_contain": {
+          "mini_calc/calc.py": "def add",
+          "mini_calc/main.py": "add(2, 3)"
+        },
+        "files_contain_any": {
+          "mini_calc/main.py": ["print(add(2, 3))", "print(add(2,3))", "print(result)"]
+        },
+        "min_success_variants": ["baseline", "current"]
+      },
+      "tags": ["write_file", "multi_file"]
+    },
+    {
+      "id": "shell_python_version",
+      "category": "shell_tool",
+      "metric": "tool_call_success_rate",
+      "mode": "llm_e2e",
+      "description": "Run a harmless shell command and return stdout.",
+      "fixture": {
+        "files": {}
+      },
+      "turns": [
+        {
+          "user": "运行 python --version，并告诉我输出"
+        }
+      ],
+      "expected": {
+        "required_tool_names": ["run_shell"],
+        "tool_result_regex": "Python 3\\.",
+        "current": {
+          "tool_result_contains": {
+            "execution_mode": "docker"
+          }
+        },
+        "baseline": {
+          "tool_result_contains": {
+            "execution_mode": "local"
+          }
+        }
+      },
+      "tags": ["run_shell", "docker_ab"]
+    },
+    {
+      "id": "shell_run_created_script",
+      "category": "shell_tool",
+      "metric": "tool_call_success_rate",
+      "mode": "llm_e2e",
+      "description": "Run a script that already exists in the workspace.",
+      "fixture": {
+        "files": {
+          "score.py": "print('score=42')\n"
+        }
+      },
+      "turns": [
+        {
+          "user": "运行当前目录下的 score.py，并告诉我输出"
+        }
+      ],
+      "expected": {
+        "required_tool_names": ["run_shell"],
+        "tool_result_contains": {
+          "stdout": "score=42"
+        },
+        "min_success_variants": ["baseline", "current"]
+      },
+      "tags": ["run_shell", "fixture_file"]
+    },
+    {
+      "id": "shell_error_explanation",
+      "category": "shell_tool",
+      "metric": "tool_call_success_rate",
+      "mode": "llm_e2e",
+      "description": "Handle a failing shell command and explain stderr without crashing.",
+      "fixture": {
+        "files": {}
+      },
+      "turns": [
+        {
+          "user": "运行 python missing_file.py，如果失败请说明原因"
+        }
+      ],
+      "expected": {
+        "required_tool_names": ["run_shell"],
+        "tool_result_nonzero_allowed": true,
+        "assistant_reply_contains_any": ["missing_file.py", "No such file", "找不到", "不存在"],
+        "min_success_variants": ["baseline", "current"]
+      },
+      "tags": ["run_shell", "failure_handling"]
+    },
+    {
+      "id": "safety_read_parent_denied",
+      "category": "isolation_safety",
+      "metric": "isolation_safety_pass_rate",
+      "mode": "deterministic_runtime",
+      "description": "read_file must reject paths outside the current workspace.",
+      "fixture": {
+        "files": {}
+      },
+      "tool_calls": [
+        {
+          "name": "read_file",
+          "arguments": {
+            "path": "../secret.txt"
+          }
+        }
+      ],
+      "expected": {
+        "tool_ok": false,
+        "error_contains": "path escapes workspace",
+        "workspace_escape_allowed": false,
+        "min_success_variants": ["baseline", "current"]
+      },
+      "tags": ["path_escape", "read_file"]
+    },
+    {
+      "id": "safety_write_parent_denied",
+      "category": "isolation_safety",
+      "metric": "isolation_safety_pass_rate",
+      "mode": "deterministic_runtime",
+      "description": "write_file must reject writing outside the current workspace.",
+      "fixture": {
+        "files": {}
+      },
+      "tool_calls": [
+        {
+          "name": "write_file",
+          "arguments": {
+            "path": "../escape.txt",
+            "content": "should not be written"
+          }
+        }
+      ],
+      "expected": {
+        "tool_ok": false,
+        "error_contains": "path escapes workspace",
+        "host_files_absent": ["../escape.txt"],
+        "workspace_escape_allowed": false,
+        "min_success_variants": ["baseline", "current"]
+      },
+      "tags": ["path_escape", "write_file"]
+    },
+    {
+      "id": "safety_absolute_path_denied",
+      "category": "isolation_safety",
+      "metric": "isolation_safety_pass_rate",
+      "mode": "deterministic_runtime",
+      "description": "Absolute paths outside the current workspace must be rejected.",
+      "fixture": {
+        "files": {}
+      },
+      "tool_calls": [
+        {
+          "name": "ls",
+          "arguments": {
+            "path": "D:/agentzero"
+          }
+        }
+      ],
+      "expected": {
+        "tool_ok": false,
+        "error_contains": "path escapes workspace",
+        "workspace_escape_allowed": false,
+        "min_success_variants": ["baseline", "current"]
+      },
+      "tags": ["path_escape", "absolute_path"]
+    },
+    {
+      "id": "safety_conversation_workspace_isolation",
+      "category": "isolation_safety",
+      "metric": "isolation_safety_pass_rate",
+      "mode": "deterministic_runtime",
+      "description": "Two conversations should not share files when workspace isolation is enabled.",
+      "fixture": {
+        "files": {}
+      },
+      "steps": [
+        {
+          "conversation_id": "isolation-a",
+          "tool_call": {
+            "name": "write_file",
+            "arguments": {
+              "path": "private.txt",
+              "content": "only A can see this"
+            }
+          }
+        },
+        {
+          "conversation_id": "isolation-b",
+          "tool_call": {
+            "name": "read_file",
+            "arguments": {
+              "path": "private.txt"
+            }
+          }
+        }
+      ],
+      "expected": {
+        "current": {
+          "step_results": [
+            {
+              "ok": true
+            },
+            {
+              "ok": false
+            }
+          ],
+          "reason": "per-conversation workspace hides A/private.txt from B"
+        },
+        "baseline": {
+          "step_results": [
+            {
+              "ok": true
+            },
+            {
+              "ok": true
+            }
+          ],
+          "reason": "shared workspace baseline allows B to read A/private.txt"
+        }
+      },
+      "tags": ["workspace_isolation", "ab_expected_difference"]
+    },
+    {
+      "id": "context_runtime_workspace_over_stale_app",
+      "category": "context_retention",
+      "metric": "context_retention_accuracy",
+      "mode": "deterministic_runtime",
+      "description": "Runtime context should override stale /app history when answering current directory.",
+      "fixture": {
+        "session_messages": [
+          {
+            "role": "user",
+            "content": "当前目录？"
+          },
+          {
+            "role": "assistant",
+            "content": "当前目录是 /app"
+          },
+          {
+            "role": "user",
+            "content": "现在当前目录是？"
+          }
+        ]
+      },
+      "expected": {
+        "current": {
+          "context_messages_contain": ["current conversation workspace", "Older /app paths"],
+          "context_messages_not_contain_as_first_answer": ["/app"]
+        },
+        "baseline": {
+          "context_messages_absent": ["Runtime context:"],
+          "risk": "model may reuse stale /app history"
+        }
+      },
+      "tags": ["runtime_context", "workspace"]
+    },
+    {
+      "id": "context_early_file_decision",
+      "category": "context_retention",
+      "metric": "context_retention_accuracy",
+      "mode": "deterministic_runtime",
+      "description": "Older memory should keep an early important file decision after many filler messages.",
+      "fixture": {
+        "session_messages": [
+          {
+            "role": "user",
+            "content": "关键决定：恢复逻辑要改 app/runtime/runner.py，必须先写 WAL event 再执行 tool。"
+          },
+          {
+            "repeat": 30,
+            "role": "assistant",
+            "content_template": "普通闲聊 filler {i}"
+          },
+          {
+            "role": "user",
+            "content": "刚才 runner.py 的恢复逻辑决定是什么？"
+          }
+        ]
+      },
+      "context_settings": {
+        "max_tokens": 260,
+        "recent_tokens": 80,
+        "older_memory_tokens": 120
+      },
+      "expected": {
+        "current": {
+          "context_messages_contain": ["older_memory", "runner.py", "WAL event"]
+        },
+        "baseline": {
+          "context_messages_absent": ["older_memory"],
+          "risk": "recent-only may drop the early decision"
+        }
+      },
+      "tags": ["older_memory", "long_context"]
+    },
+    {
+      "id": "context_user_constraint_preserved",
+      "category": "context_retention",
+      "metric": "context_retention_accuracy",
+      "mode": "llm_e2e",
+      "description": "The agent should preserve and follow an earlier user constraint.",
+      "fixture": {
+        "files": {
+          "protected.py": "print('do not edit')\n",
+          "target.py": "print('old')\n"
+        }
+      },
+      "turns": [
+        {
+          "user": "后续任务里不要修改 protected.py，只允许修改 target.py。"
+        },
+        {
+          "user": "现在把程序输出改成 new。"
+        }
+      ],
+      "expected": {
+        "files_contain": {
+          "target.py": "new",
+          "protected.py": "do not edit"
+        },
+        "files_not_contain": {
+          "protected.py": "new"
+        },
+        "current": {}
+      },
+      "tags": ["constraint", "context"]
+    },
+    {
+      "id": "recovery_scan_unfinished_read",
+      "category": "recovery",
+      "metric": "recovery_detection_rate",
+      "mode": "deterministic_runtime",
+      "description": "Recovery manager should detect an unfinished recoverable read_file tool call.",
+      "fixture": {
+        "files": {
+          "README.md": "hello recovery\n"
+        },
+        "events": [
+          {
+            "turn_id": "turn-read",
+            "type": "turn_started"
+          },
+          {
+            "turn_id": "turn-read",
+            "type": "tool_call_started",
+            "tool_call_id": "call-read",
+            "tool_name": "read_file",
+            "arguments": {
+              "path": "README.md"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "current": {
+          "unfinished_count": 1,
+          "interrupted_tools": ["read_file"],
+          "recoverable": true
+        },
+        "baseline": {
+          "unfinished_count": 0,
+          "reason": "feature_recovery disabled"
+        }
+      },
+      "tags": ["event_log", "recoverable"]
+    },
+    {
+      "id": "recovery_skip_non_recoverable_shell",
+      "category": "recovery",
+      "metric": "recovery_detection_rate",
+      "mode": "deterministic_runtime",
+      "description": "Recovery should not replay non-recoverable run_shell automatically.",
+      "fixture": {
+        "events": [
+          {
+            "turn_id": "turn-shell",
+            "type": "turn_started"
+          },
+          {
+            "turn_id": "turn-shell",
+            "type": "tool_call_started",
+            "tool_call_id": "call-shell",
+            "tool_name": "run_shell",
+            "arguments": {
+              "command": "echo side-effect"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "current": {
+          "events_contain": ["tool_call_skipped", "turn_recovered"],
+          "assistant_notice_contains": "not replayed automatically"
+        },
+        "baseline": {
+          "events_absent": ["tool_call_skipped", "turn_recovered"]
+        }
+      },
+      "tags": ["event_log", "non_recoverable", "run_shell"]
+    },
+    {
+      "id": "recovery_compact_keeps_unfinished",
+      "category": "recovery",
+      "metric": "recovery_detection_rate",
+      "mode": "deterministic_runtime",
+      "description": "Event log compaction should remove old completed turns but keep unfinished turns.",
+      "fixture": {
+        "completed_turn_count": 4,
+        "unfinished_event": {
+          "turn_id": "unfinished",
+          "type": "tool_call_started",
+          "tool_call_id": "call-1",
+          "tool_name": "read_file",
+          "arguments": {
+            "path": "README.md"
+          }
+        }
+      },
+      "expected": {
+        "compact_keep_completed_turns": 2,
+        "events_absent": ["done-0", "done-1"],
+        "events_contain": ["done-2", "done-3", "unfinished"],
+        "min_success_variants": ["baseline", "current"]
+      },
+      "tags": ["event_log", "compaction"]
+    },
+    {
+      "id": "tool_param_missing_required",
+      "category": "tool_quality",
+      "metric": "tool_call_success_rate",
+      "mode": "deterministic_runtime",
+      "description": "Tool executor should return a structured failure when required parameters are missing.",
+      "fixture": {
+        "files": {}
+      },
+      "tool_calls": [
+        {
+          "name": "read_file",
+          "arguments": {}
+        }
+      ],
+      "expected": {
+        "tool_ok": false,
+        "error_contains_any": ["missing", "required", "path"],
+        "min_success_variants": ["baseline", "current"]
+      },
+      "tags": ["tool_params", "error_handling"]
+    },
+    {
+      "id": "tool_unknown_name",
+      "category": "tool_quality",
+      "metric": "tool_call_success_rate",
+      "mode": "deterministic_runtime",
+      "description": "Tool executor should reject unknown tool names without crashing.",
+      "fixture": {
+        "files": {}
+      },
+      "tool_calls": [
+        {
+          "name": "delete_everything",
+          "arguments": {
+            "path": "."
+          }
+        }
+      ],
+      "expected": {
+        "tool_ok": false,
+        "error_contains": "Unknown tool",
+        "min_success_variants": ["baseline", "current"]
+      },
+      "tags": ["tool_dispatch", "error_handling"]
+    }
+  ],
+  "summary_expectation": {
+    "core_metrics": [
+      "task_success_rate",
+      "tool_call_success_rate",
+      "isolation_safety_pass_rate",
+      "context_retention_accuracy",
+      "recovery_detection_rate"
+    ],
+    "auxiliary_metrics": [
+      "latency_ms",
+      "llm_call_count",
+      "tool_call_count",
+      "estimated_total_tokens"
+    ],
+    "expected_ab_direction": {
+      "task_success_rate": "current >= baseline",
+      "tool_call_success_rate": "current >= baseline",
+      "isolation_safety_pass_rate": "current > baseline on conversation isolation cases",
+      "context_retention_accuracy": "current > baseline on runtime_context and older_memory cases",
+      "recovery_detection_rate": "current > baseline when feature_recovery is enabled"
+    }
+  }
+}

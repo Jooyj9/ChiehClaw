@@ -1,0 +1,28 @@
+services:
+  chiehclaw-feishu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chiehclaw:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Agent 服务容器内的 workspace root；每个 conversation 会映射到一个子目录。
+      XXXCLAW_WORKSPACE_ROOT_DIR: /workspaces
+    volumes:
+      # 宿主机仓库根 → 容器 /app，与本机文件双向同步。可在项目根 .env 设 XXXCLAW_REPO_ROOT（Windows 建议 D:/path/to/xxxclaw）
+      - ${XXXCLAW_REPO_ROOT:-.}:/app
+      # 用户/会话工作区，不和 Agent 源码目录混在一起。
+      - ${XXXCLAW_WORKSPACE_ROOT_HOST:-../xxxclaw-workspace}:/workspaces
+      # 整仓挂载会盖住镜像内构建产生的 .venv；单独卷存放 Linux 依赖，避免往 Windows 目录写入容器版 .venv
+      - chiehclaw-uv-venv:/app/.venv
+    command:
+      [
+        "sh",
+        "-c",
+        "uv sync && exec uv run python -m app.adapters.feishu.long_connection",
+      ]
+
+volumes:
+  chiehclaw-uv-venv:
