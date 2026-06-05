@@ -74,6 +74,7 @@ class AgentLoop:
             if not response.tool_calls:
                 return response
 
+            tool_results = []
             for tool_call in response.tool_calls:
                 self._emit(
                     event_sink,
@@ -92,6 +93,10 @@ class AgentLoop:
                     arguments=tool_call.arguments,
                 )
                 result = self.tool_executor.execute(tool_call)
+                tool_results.append((tool_call, result))
+
+            fitted_results = self.tool_executor.fit_turn_result_budget(tool_results)
+            for tool_call, result in zip(response.tool_calls, fitted_results, strict=True):
                 event_type = "tool_call_succeeded" if result.get("ok") else "tool_call_failed"
                 self._emit(
                     event_sink,

@@ -41,6 +41,8 @@ class Settings:
     context_recent_tokens: int = 20000
     context_older_memory_tokens: int = 5000
     tool_result_max_chars: int = 4000
+    tool_result_single_max_chars: int = 50000
+    tool_result_turn_budget_chars: int = 200000
     assistant_reasoning_max_chars: int = 2000
     skill_history_window_messages: int = 8
     event_log_retained_completed_turns: int = 200
@@ -117,6 +119,8 @@ class Settings:
             context_recent_tokens=int(os.getenv("XXXCLAW_CONTEXT_RECENT_TOKENS", "20000")),
             context_older_memory_tokens=int(os.getenv("XXXCLAW_CONTEXT_OLDER_MEMORY_TOKENS", "5000")),
             tool_result_max_chars=int(os.getenv("XXXCLAW_TOOL_RESULT_MAX_CHARS", "4000")),
+            tool_result_single_max_chars=int(os.getenv("XXXCLAW_TOOL_RESULT_SINGLE_MAX_CHARS", "50000")),
+            tool_result_turn_budget_chars=int(os.getenv("XXXCLAW_TOOL_RESULT_TURN_BUDGET_CHARS", "200000")),
             assistant_reasoning_max_chars=int(os.getenv("XXXCLAW_ASSISTANT_REASONING_MAX_CHARS", "2000")),
             skill_history_window_messages=int(os.getenv("XXXCLAW_SKILL_HISTORY_WINDOW_MESSAGES", "8")),
             event_log_retained_completed_turns=int(os.getenv("XXXCLAW_EVENT_LOG_RETAINED_COMPLETED_TURNS", "200")),

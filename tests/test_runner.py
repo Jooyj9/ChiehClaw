@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import shutil
 import unittest
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.agent.tool_executor import ToolExecutor
+from app.agent.loop import AgentLoop
 from app.agent.tools import Tool, build_default_tools
 from app.agent.session import Session
 from app.agent.skills import SkillRouter
@@ -300,18 +302,19 @@ class RunnerTestCase(unittest.TestCase):
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
-    def test_tool_executor_sanitizes_truncates_summarizes_and_audits_result(self) -> None:
+    def test_tool_executor_sanitizes_truncates_and_keeps_summary_out_of_result(self) -> None:
         root = Path.cwd() / "data" / "test-tool-executor-after-hook"
         shutil.rmtree(root, ignore_errors=True)
         root.mkdir(parents=True, exist_ok=True)
         try:
             audit_log_path = root / "logs" / "tool_audit.jsonl"
+            long_result_log_path = root / "tool_result.jsonl"
 
             def run_shell() -> dict[str, str | int]:
                 return {
                     "execution_mode": "local",
                     "returncode": 0,
-                    "stdout": "OPENAI_API_KEY=secret-value\n" + ("x" * 120),
+                    "stdout": "OPENAI_API_KEY=secret-value\n" + ("x" * 2600),
                     "api_key": "secret-value",
                 }
 
@@ -326,8 +329,9 @@ class RunnerTestCase(unittest.TestCase):
                     )
                 ],
                 audit_log_path=audit_log_path,
-                max_result_chars=1200,
-                max_field_chars=80,
+                long_result_log_path=long_result_log_path,
+                max_result_chars=600,
+                max_field_chars=2000,
             )
 
             result = executor.execute(ToolCall(id="call-shell", name="run_shell", arguments={}))
@@ -335,14 +339,172 @@ class RunnerTestCase(unittest.TestCase):
             serialized = executor.serialize_result(result)
             audit_log = audit_log_path.read_text(encoding="utf-8")
             self.assertTrue(result["ok"])
-            self.assertIn("summary", result)
+            self.assertIn("tool_result_ref", result)
+            self.assertNotIn("truncated", result)
+            self.assertNotIn("summary", result)
             self.assertNotIn("audit", result)
-            self.assertIn("stdout_chars", result["summary"])
+            self.assertIn("stdout", result["result"])
+            self.assertLessEqual(len(result["result"]["stdout"]), 2050)
+            self.assertNotIn("execution_mode", result["result"])
+            self.assertNotIn("returncode", result["result"])
             self.assertIn("[REDACTED]", serialized)
             self.assertIn("[truncated", serialized)
             self.assertNotIn("secret-value", serialized)
             self.assertIn("call-shell", audit_log)
+            self.assertIn("stdout_chars", audit_log)
+            self.assertIn("result_truncated", audit_log)
             self.assertNotIn("secret-value", audit_log)
+            long_result_log = long_result_log_path.read_text(encoding="utf-8")
+            self.assertIn(result["tool_result_ref"], long_result_log)
+            self.assertIn("x" * 2200, long_result_log)
+            self.assertNotIn("secret-value", long_result_log)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_tool_executor_keeps_read_file_content_without_summary_bloat(self) -> None:
+        def read_file() -> dict[str, str]:
+            return {"path": "sample.txt", "content": "hello from file"}
+
+        executor = ToolExecutor(
+            [
+                Tool(
+                    name="read_file",
+                    skill_name="workspace",
+                    description="test",
+                    parameters_schema={"type": "object"},
+                    handler=read_file,
+                )
+            ],
+            max_result_chars=1200,
+        )
+
+        result = executor.execute(ToolCall(id="call-read", name="read_file", arguments={}))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"]["content"], "hello from file")
+        self.assertNotIn("summary", result)
+
+    def test_tool_executor_uses_50000_chars_as_single_result_gate(self) -> None:
+        root = Path.cwd() / "data" / "test-tool-executor-single-gate"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            def read_file() -> dict[str, str]:
+                return {"path": "large.txt", "content": "x" * 51000}
+
+            executor = ToolExecutor(
+                [
+                    Tool(
+                        name="read_file",
+                        skill_name="workspace",
+                        description="test",
+                        parameters_schema={"type": "object"},
+                        handler=read_file,
+                    )
+                ],
+                long_result_log_path=root / "tool_result.jsonl",
+            )
+
+            result = executor.execute(ToolCall(id="call-large", name="read_file", arguments={}))
+
+            self.assertIn("tool_result_ref", result)
+            self.assertEqual(result["result"]["path"], "large.txt")
+            self.assertLessEqual(len(result["result"]["content"]), 2050)
+            self.assertIn("x" * 50000, (root / "tool_result.jsonl").read_text(encoding="utf-8"))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_agent_loop_applies_turn_level_tool_result_budget(self) -> None:
+        root = Path.cwd() / "data" / "test-agent-loop-turn-budget"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            class MultiToolClient:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def generate(self, messages, tools=None, system_prompt=None):
+                    self.calls += 1
+                    if self.calls == 1:
+                        return AssistantMessage(
+                            tool_calls=[
+                                ToolCall(id=f"call-{index}", name=f"tool_{index}", arguments={})
+                                for index in range(5)
+                            ]
+                        )
+                    return AssistantMessage(content="done")
+
+                def stream(self, *args, **kwargs):
+                    return self.generate(*args, **kwargs)
+
+            tools = [
+                Tool(
+                    name=f"tool_{index}",
+                    skill_name="test",
+                    description="test",
+                    parameters_schema={"type": "object"},
+                    handler=lambda index=index: {"path": f"{index}.txt", "content": str(index) * 45000},
+                )
+                for index in range(5)
+            ]
+            executor = ToolExecutor(
+                tools,
+                long_result_log_path=root / "tool_result.jsonl",
+                max_result_chars=50000,
+                turn_result_budget_chars=200000,
+            )
+            session = Session(conversation_id="turn-budget", system_prompt="")
+            session.add_user_message("run multiple tools")
+
+            AgentLoop(MultiToolClient(), executor, max_rounds=2).run(session=session, tools=tools)
+
+            tool_messages = [message for message in session.messages if message.role == "tool"]
+            payloads = [json.loads(message.content) for message in tool_messages]
+            ref_count = sum(1 for payload in payloads if payload.get("tool_result_ref"))
+            total_chars = sum(len(message.content) for message in tool_messages)
+
+            self.assertEqual(len(tool_messages), 5)
+            self.assertEqual(ref_count, 1)
+            self.assertLessEqual(total_chars, 200000)
+            self.assertTrue((root / "tool_result.jsonl").exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_tool_executor_long_ls_preview_omits_is_dir(self) -> None:
+        root = Path.cwd() / "data" / "test-tool-executor-long-ls"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            def ls() -> dict[str, object]:
+                return {
+                    "path": "workspace",
+                    "entries": [
+                        {"name": f"file-{index}.py", "path": f"workspace/file-{index}.py", "is_dir": False}
+                        for index in range(100)
+                    ],
+                }
+
+            executor = ToolExecutor(
+                [
+                    Tool(
+                        name="ls",
+                        skill_name="workspace",
+                        description="test",
+                        parameters_schema={"type": "object"},
+                        handler=ls,
+                    )
+                ],
+                long_result_log_path=root / "tool_result.jsonl",
+                max_result_chars=500,
+            )
+
+            result = executor.execute(ToolCall(id="call-ls", name="ls", arguments={}))
+
+            self.assertIn("tool_result_ref", result)
+            self.assertNotIn("truncated", result)
+            self.assertEqual(result["result"]["path"], "workspace")
+            self.assertIn("file-0.py", result["result"]["entries_preview"])
+            self.assertNotIn("is_dir", executor.serialize_result(result))
         finally:
             shutil.rmtree(root, ignore_errors=True)
 

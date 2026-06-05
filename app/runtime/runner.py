@@ -54,7 +54,9 @@ class Runner:
                 self.tools,
                 workspace_root_dir=settings.workspace_root_dir,
                 audit_log_path=settings.logs_dir / "tool_audit.jsonl",
-                max_result_chars=settings.tool_result_max_chars,
+                long_result_log_path=settings.data_dir / "tool_result.jsonl",
+                max_result_chars=settings.tool_result_single_max_chars,
+                turn_result_budget_chars=settings.tool_result_turn_budget_chars,
             ),
             max_rounds=settings.max_tool_rounds,
         )

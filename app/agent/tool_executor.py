@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -35,13 +36,17 @@ class ToolExecutor:
         *,
         workspace_root_dir: Path | None = None,
         audit_log_path: Path | None = None,
-        max_result_chars: int = 4000,
+        long_result_log_path: Path | None = None,
+        max_result_chars: int = 50000,
+        turn_result_budget_chars: int = 200000,
         max_field_chars: int = 2000,
     ) -> None:
         self._tools = {tool.name: tool for tool in tools}
         self._workspace_root_dir = workspace_root_dir
         self._audit_log_path = audit_log_path
+        self._long_result_log_path = long_result_log_path
         self._max_result_chars = max_result_chars
+        self._turn_result_budget_chars = turn_result_budget_chars
         self._max_field_chars = max_field_chars
 
     def execute(self, tool_call: ToolCall) -> dict[str, Any]:
@@ -60,6 +65,35 @@ class ToolExecutor:
             raw_result = {"ok": False, "tool": tool_call.name, "error": str(exc)}
         return self.after_tool_call(tool_call, raw_result)
 
+    def fit_turn_result_budget(self, results: list[tuple[ToolCall, dict[str, Any]]]) -> list[dict[str, Any]]:
+        budget = self._turn_result_budget_chars
+        if budget <= 0:
+            return [result for _, result in results]
+
+        serialized_sizes = [len(self.serialize_result(result)) for _, result in results]
+        total_chars = sum(serialized_sizes)
+        if total_chars <= budget:
+            return [result for _, result in results]
+
+        fitted = [result for _, result in results]
+        for index in sorted(range(len(results)), key=lambda item: serialized_sizes[item], reverse=True):
+            tool_call, result = results[index]
+            if result.get("tool_result_ref"):
+                continue
+
+            compact = self._externalize_result(
+                tool_call=tool_call,
+                result=result,
+                serialized_chars=serialized_sizes[index],
+            )
+            compact_size = len(self.serialize_result(compact))
+            fitted[index] = compact
+            total_chars -= serialized_sizes[index] - compact_size
+            if total_chars <= budget:
+                break
+
+        return fitted
+
     def before_tool_call(self, tool_call: ToolCall) -> None:
         if self._workspace_root_dir is None:
             return
@@ -75,21 +109,24 @@ class ToolExecutor:
 
     def after_tool_call(self, tool_call: ToolCall, raw_result: dict[str, Any]) -> dict[str, Any]:
         original_chars = len(self.serialize_result(raw_result))
-        sanitized_result, redacted_count, truncated_count = self._sanitize(raw_result)
-        summary = self._summarize_result(sanitized_result)
-        result = {
-            **sanitized_result,
-            "summary": summary,
-        }
-        result = self._fit_result_budget(result)
+        sanitized_result, redacted_count = self._sanitize(raw_result)
+        result_truncated = len(self.serialize_result(sanitized_result)) > self._max_result_chars
+        audit_summary = self._summarize_result(sanitized_result)
+        result = self._fit_result_budget(tool_call=tool_call, result=sanitized_result)
+        result_ref = result.get("tool_result_ref")
+        if result_truncated:
+            audit_summary["result_truncated"] = True
+        if result_ref:
+            audit_summary["tool_result_ref"] = result_ref
         self._write_audit_log(
             tool_call=tool_call,
             result=result,
+            summary=audit_summary,
             stats={
                 "original_chars": original_chars,
                 "serialized_chars": len(self.serialize_result(result)),
                 "redacted_fields": redacted_count,
-                "truncated_fields": truncated_count,
+                "result_truncated": result_truncated,
             },
         )
         return result
@@ -98,12 +135,11 @@ class ToolExecutor:
     def serialize_result(result: dict[str, Any]) -> str:
         return json.dumps(result, ensure_ascii=False, indent=2)
 
-    def _sanitize(self, value: Any) -> tuple[Any, int, int]:
+    def _sanitize(self, value: Any) -> tuple[Any, int]:
         redacted_count = 0
-        truncated_count = 0
 
         def visit(current: Any, key: str = "") -> Any:
-            nonlocal redacted_count, truncated_count
+            nonlocal redacted_count
 
             if self._is_sensitive_key(key):
                 redacted_count += 1
@@ -116,34 +152,63 @@ class ToolExecutor:
                 redacted = self._redact_string(current)
                 if redacted != current:
                     redacted_count += 1
-                if len(redacted) > self._max_field_chars:
-                    truncated_count += 1
-                    return self._truncate(redacted, self._max_field_chars)
                 return redacted
             return current
 
-        return visit(value), redacted_count, truncated_count
+        return visit(value), redacted_count
 
-    def _fit_result_budget(self, result: dict[str, Any]) -> dict[str, Any]:
+    def _fit_result_budget(self, tool_call: ToolCall, result: dict[str, Any]) -> dict[str, Any]:
         serialized = self.serialize_result(result)
         if len(serialized) <= self._max_result_chars:
+            return result
+
+        return self._externalize_result(tool_call=tool_call, result=result, serialized_chars=len(serialized))
+
+    def _externalize_result(self, tool_call: ToolCall, result: dict[str, Any], serialized_chars: int) -> dict[str, Any]:
+        result_ref = self._persist_long_result(
+            tool_call=tool_call,
+            result=result,
+            serialized_chars=serialized_chars,
+        )
+        if result_ref is None:
             return result
 
         compact = {
             "ok": result.get("ok", False),
             "tool": result.get("tool"),
-            "error": result.get("error"),
-            "summary": {
-                **dict(result.get("summary") or {}),
-                "result_truncated": True,
-                "truncated_reason": f"serialized tool result exceeded {self._max_result_chars} chars",
-            },
         }
+        compact["tool_result_ref"] = result_ref
+        if result.get("error"):
+            compact["error"] = self._truncate(str(result.get("error")), self._preview_chars())
         if "result" in result:
             compact["result"] = self._preview_value(result["result"])
         return compact
 
-    def _write_audit_log(self, tool_call: ToolCall, result: dict[str, Any], stats: dict[str, Any]) -> None:
+    def _persist_long_result(self, tool_call: ToolCall, result: dict[str, Any], serialized_chars: int) -> str | None:
+        if self._long_result_log_path is None:
+            return None
+
+        result_ref = str(uuid.uuid4())
+        append_jsonl(
+            self._long_result_log_path,
+            {
+                "ts": datetime.now(UTC).isoformat(),
+                "tool_result_ref": result_ref,
+                "tool_call_id": tool_call.id,
+                "tool_name": tool_call.name,
+                "serialized_chars": serialized_chars,
+                "result": result,
+            },
+        )
+        return result_ref
+
+    def _write_audit_log(
+        self,
+        tool_call: ToolCall,
+        result: dict[str, Any],
+        summary: dict[str, Any],
+        stats: dict[str, Any],
+    ) -> None:
         if self._audit_log_path is None:
             return
 
@@ -154,7 +219,7 @@ class ToolExecutor:
                 "tool_call_id": tool_call.id,
                 "tool_name": tool_call.name,
                 "ok": bool(result.get("ok")),
-                "summary": result.get("summary", {}),
+                "summary": summary,
                 "stats": stats,
             },
         )
@@ -181,19 +246,27 @@ class ToolExecutor:
     def _preview_value(self, value: Any) -> Any:
         if isinstance(value, dict):
             preview: dict[str, Any] = {}
-            for key in ("path", "cwd", "workspace", "container_cwd", "execution_mode", "returncode", "bytes_written"):
+            for key in ("path", "cwd"):
                 if key in value:
                     preview[key] = value[key]
             for key in ("content", "stdout", "stderr"):
                 if isinstance(value.get(key), str):
-                    preview[key] = self._truncate(value[key], 500)
+                    preview[key] = self._truncate(value[key], self._preview_chars())
             if "entries" in value and isinstance(value["entries"], list):
-                preview["entries_preview"] = value["entries"][:20]
-                preview["entry_count"] = len(value["entries"])
+                preview["entries_preview"] = [self._entry_name(item) for item in value["entries"][:20]]
             return preview
         if isinstance(value, str):
-            return self._truncate(value, 500)
+            return self._truncate(value, self._preview_chars())
         return value
+
+    def _preview_chars(self) -> int:
+        return min(self._max_field_chars, 2000)
+
+    @staticmethod
+    def _entry_name(value: Any) -> str:
+        if isinstance(value, dict):
+            return str(value.get("name") or value.get("path") or value)
+        return str(value)
 
     @staticmethod
     def _is_sensitive_key(key: str) -> bool:
